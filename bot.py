@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -138,7 +139,8 @@ def load_subscribers() -> set:
         return set()
     try:
         with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+            data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
     except Exception:
         return set()
 
@@ -219,7 +221,7 @@ def format_schedule_text(day_code: str) -> str:
         )
     return text
 
-# ================= АВТО-РАССЫЛКА =================
+# ================= АВТО-РАССЫЛКА (С ЗАЩИТОЙ ОТ ОШИБОК) =================
 
 async def daily_morning_broadcast():
     now_irk = datetime.now()
@@ -232,7 +234,9 @@ async def daily_morning_broadcast():
     text = f"🌅 <b>Доброе утро! Расписание на сегодня:</b>\n\n" + format_schedule_text(day_code)
     
     subs = load_subscribers()
-    for chat_id in subs:
+    dead_subs = set()
+
+    for chat_id in list(subs):
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -241,8 +245,15 @@ async def daily_morning_broadcast():
                 reply_markup=get_schedule_keyboard()
             )
             await asyncio.sleep(0.05)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            dead_subs.add(chat_id)
         except Exception:
             pass
+
+    if dead_subs:
+        subs.difference_update(dead_subs)
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(subs), f)
 
 # ================= ОБЩИЙ ДОСТУП =================
 
@@ -350,10 +361,11 @@ async def cb_do_broadcast(call: CallbackQuery):
     subs = load_subscribers()
     sent_count = 0
     fail_count = 0
+    dead_subs = set()
 
     await call.message.edit_text("⏳ Идет рассылка сообщений...")
 
-    for chat_id in subs:
+    for chat_id in list(subs):
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -363,13 +375,21 @@ async def cb_do_broadcast(call: CallbackQuery):
             )
             sent_count += 1
             await asyncio.sleep(0.05)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            fail_count += 1
+            dead_subs.add(chat_id)
         except Exception:
             fail_count += 1
+
+    if dead_subs:
+        subs.difference_update(dead_subs)
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(subs), f)
 
     await call.message.answer(
         f"✅ <b>Рассылка завершена!</b>\n\n"
         f"📨 Успешно отправлено: <b>{sent_count}</b>\n"
-        f"⚠️ Ошибок: <b>{fail_count}</b>",
+        f"⚠️ Ошибок (заблокировали/удалили бота): <b>{fail_count}</b>",
         parse_mode="HTML",
     )
     await show_admin_main(call.message)
@@ -663,7 +683,6 @@ async def start_web_server():
 # ================= ЗАПУСК =================
 
 async def main():
-    # Запуск планировщика на 06:30 (Пн-Сб)
     scheduler.add_job(
         daily_morning_broadcast,
         trigger="cron",
@@ -673,10 +692,7 @@ async def main():
     )
     scheduler.start()
 
-    # Запуск микро-сервера для Render
     await start_web_server()
-
-    # Запуск polling бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
